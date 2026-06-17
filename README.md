@@ -5,4 +5,5 @@ This is mkfs.claudex - a filesystem compression tool that creates .claudex archi
 currently alot being tested 
 
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/cdb0026b-b03d-4e65-8f5d-ecded830b110" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/ca78233c-0d5c-4916-a855-fe82258e210d" />
+
