@@ -2,7 +2,9 @@
 This is mkfs.claudex - a filesystem compression tool that creates .claudex archive images from directory structures
 
 
-claudex uses lzma compression algorithm with that i have found a very good ratio thats fast and compressed to my needs it also reads using fuse3 when mounted
+claudex uses lzma compression algorithm with custom multi-threading and random access 
+
+with that i have found a very good ratio thats fast and compressed to my needs it also reads using fuse3 when mounted
 
 (more tests going on this is just a template ui will change)
 
