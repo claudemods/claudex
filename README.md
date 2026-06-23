@@ -11,5 +11,8 @@ with that i have found a very good ratio thats fast and compressed to my needs i
 
 <img width="1280" height="800" alt="yes" src="https://github.com/user-attachments/assets/fd140765-6abd-4e50-b0d7-e0645c77b6d8" />
 
+<img width="1280" height="800" alt="testing" src="https://github.com/user-attachments/assets/adc5c6c0-8d63-435b-aca9-7e3a11a5f07e" />
+
+
 
 
