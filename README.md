@@ -208,7 +208,6 @@ Each metadata entry holds a path, mode, uid, gid and mtime. Regular files add da
 ## Limitations
 
 - Extended attributes, ACLs and file capabilities are not stored.
-- Hard links are restored as separate files. Their data is still stored only once.
 - Images are read-only. Rebuild to change contents.
 - x86 filtering only targets x86/x86-64 code. Other architectures still compress, just without the filter.
 - Maximum block size is 64 MiB. Maximum path length is 8191 bytes.
