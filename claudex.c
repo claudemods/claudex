@@ -1795,6 +1795,8 @@ typedef struct packer {
     uint64_t hardlink_bytes;    // extra names of hard-linked files: not stored twice
     uint32_t hardlink_names;
 
+    uint64_t system_used;       // space used on the source filesystem(s), as df reports it
+
     // statistics, protected by mutex
     uint64_t total_source_size; // exact bytes of file data that will be read
     uint64_t current_output_size;
@@ -1910,7 +1912,7 @@ static void draw_progress(packer_t *p, float percentage) {
     char out_str[32], cloned_str[32], total_str[32];
     format_size(p->current_output_size, out_str, sizeof(out_str));
     format_size(p->current_cloned_size, cloned_str, sizeof(cloned_str));
-    format_size(p->total_source_size, total_str, sizeof(total_str));
+    format_size(p->system_used ? p->system_used : p->total_source_size, total_str, sizeof(total_str));
 
     // Visible widths of each part, to fit the line inside the terminal
     char pct_txt[16], name_txt[1100], cloned_txt[96], time_txt[48];
@@ -1961,7 +1963,8 @@ static void* progress_thread(void *arg) {
             pthread_mutex_unlock(&p->mutex);
             break;
         }
-        float pct = p->total_source_size ? (p->current_cloned_size * 100.0f) / p->total_source_size : 0.0f;
+        uint64_t total = p->system_used ? p->system_used : p->total_source_size;
+        float pct = total ? (p->current_cloned_size * 100.0f) / total : 0.0f;
         draw_progress(p, pct);
         pthread_mutex_unlock(&p->mutex);
         usleep(100000);
@@ -2241,6 +2244,40 @@ static void find_hard_links(packer_t *p) {
     free(idx);
 }
 
+// Used space of the filesystem holding path: (blocks - free blocks) x block size, like df
+static uint64_t fs_used_bytes(const char *path) {
+    struct statvfs sv;
+    if (statvfs(path, &sv) != 0) return 0;
+    return (uint64_t)(sv.f_blocks - sv.f_bfree) * (uint64_t)sv.f_frsize;
+}
+
+/* Space used on the source's filesystem plus each other filesystem mounted
+ * inside it (each device counted once). */
+static uint64_t system_used_space(packer_t *p) {
+    struct stat st;
+    if (stat(p->source_root, &st) != 0) return 0;
+    uint64_t total = fs_used_bytes(p->source_root);
+
+    dev_t *seen = malloc((p->mount_count + 1) * sizeof(dev_t));
+    if (!seen) return total;
+    uint32_t nseen = 0;
+    seen[nseen++] = st.st_dev;
+
+    char path[MAX_PATH_LEN];
+    for (uint32_t m = 0; m < p->mount_count; m++) {
+        join_path(path, sizeof(path), p->source_root, p->mounts[m], NULL);
+        struct stat ms;
+        if (stat(path, &ms) != 0) continue;
+        uint32_t k = 0;
+        while (k < nseen && seen[k] != ms.st_dev) k++;
+        if (k < nseen) continue;
+        seen[nseen++] = ms.st_dev;
+        total += fs_used_bytes(path);
+    }
+    free(seen);
+    return total;
+}
+
 typedef struct {
     char name[256];
     uint64_t bytes;
@@ -2305,6 +2342,10 @@ static void print_scan_summary(packer_t *p) {
     }
 
     char total[32], s[32];
+    if (p->system_used) {
+        format_size(p->system_used, s, sizeof(s));
+        printf("\033[32mSystem space used: %s (%" PRIu64 " bytes, as df reports it)\033[0m\n", s, p->system_used);
+    }
     format_size(p->total_source_size, total, sizeof(total));
     printf("\033[32mFound %u files, %u folders, %u symlinks", files, dirs, symlinks);
     if (other) printf(", %u special files", other);
@@ -3196,6 +3237,7 @@ static int cmd_create(int argc, char **argv) {
                     p->order[p->order_count++] = i;
                 }
             }
+            p->system_used = system_used_space(p);
             print_scan_summary(p);
             g_sort = p;
             qsort(p->order, p->order_count, sizeof(uint32_t), cmp_stream_order);
