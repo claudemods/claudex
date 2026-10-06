@@ -1783,8 +1783,20 @@ typedef struct packer {
     int io_errno;
     uint64_t stream_size;       // set by the producer when it finishes
 
+    // folders already scanned (device + inode), so no folder is counted twice
+    uint64_t *seen_dev, *seen_ino;
+    uint8_t *seen_used;
+    uint32_t seen_cap, seen_count;
+    uint32_t revisits;          // folders skipped because they were already scanned
+
+    // scan results, for the summary
+    char **mounts;              // folders that are a different filesystem than their parent
+    uint32_t mount_count;
+    uint64_t hardlink_bytes;    // extra names of hard-linked files: not stored twice
+    uint32_t hardlink_names;
+
     // statistics, protected by mutex
-    uint64_t total_source_size;
+    uint64_t total_source_size; // exact bytes of file data that will be read
     uint64_t current_output_size;
     uint64_t current_cloned_size;
     uint64_t dedup_saved;
@@ -2035,13 +2047,57 @@ static int add_entry(packer_t *p, const char *rel_path, const struct stat *st) {
     e->link_to = NO_LINK;
     e->dev = (uint64_t)st->st_dev;
     e->ino = (uint64_t)st->st_ino;
-    e->multi_link = S_ISREG(st->st_mode) && st->st_nlink > 1;
+    // Every regular file takes part in the same-file check (device + inode), not
+    // only ones with st_nlink > 1: the same file can be reached by more than one path
+    e->multi_link = S_ISREG(st->st_mode);
     p->entry_count++;
     if (S_ISREG(st->st_mode)) p->total_source_size += e->size;
     return 0;
 }
 
-static int traverse_directory(packer_t *p, const char *full, const char *rel) {
+/* Remembers a folder by device + inode. Returns 1 the first time it is seen,
+ * 0 if it was already scanned (bind mount, or a mount loop), -1 out of memory. */
+static int mark_folder_seen(packer_t *p, uint64_t dev, uint64_t ino) {
+    if (p->seen_count * 2 >= p->seen_cap) {
+        uint32_t cap = p->seen_cap ? p->seen_cap * 2 : 4096;
+        uint64_t *d = calloc(cap, sizeof(uint64_t));
+        uint64_t *n = calloc(cap, sizeof(uint64_t));
+        uint8_t *u = calloc(cap, 1);
+        if (!d || !n || !u) {
+            free(d);
+            free(n);
+            free(u);
+            return -1;
+        }
+        for (uint32_t i = 0; i < p->seen_cap; i++) {
+            if (!p->seen_used[i]) continue;
+            uint32_t h = (uint32_t)((p->seen_dev[i] * 0x9E3779B97F4A7C15ull) ^ (p->seen_ino[i] * 0xC2B2AE3D27D4EB4Full)) & (cap - 1);
+            while (u[h]) h = (h + 1) & (cap - 1);
+            d[h] = p->seen_dev[i];
+            n[h] = p->seen_ino[i];
+            u[h] = 1;
+        }
+        free(p->seen_dev);
+        free(p->seen_ino);
+        free(p->seen_used);
+        p->seen_dev = d;
+        p->seen_ino = n;
+        p->seen_used = u;
+        p->seen_cap = cap;
+    }
+    uint32_t h = (uint32_t)((dev * 0x9E3779B97F4A7C15ull) ^ (ino * 0xC2B2AE3D27D4EB4Full)) & (p->seen_cap - 1);
+    while (p->seen_used[h]) {
+        if (p->seen_dev[h] == dev && p->seen_ino[h] == ino) return 0;
+        h = (h + 1) & (p->seen_cap - 1);
+    }
+    p->seen_dev[h] = dev;
+    p->seen_ino[h] = ino;
+    p->seen_used[h] = 1;
+    p->seen_count++;
+    return 1;
+}
+
+static int traverse_directory(packer_t *p, const char *full, const char *rel, dev_t dev) {
     DIR *dir = opendir(full);
     if (!dir) {
         warnf(p, "cannot open directory %s: %s", full, strerror(errno));
@@ -2089,9 +2145,31 @@ static int traverse_directory(packer_t *p, const char *full, const char *rel) {
             rc = -1;
             break;
         }
-        if (S_ISDIR(st.st_mode) && traverse_directory(p, child_full, child_rel) != 0) {
-            rc = -1;
-            break;
+        if (S_ISDIR(st.st_mode) && st.st_dev != dev) {
+            // Another filesystem mounted here: remember it for the scan summary
+            char **m = realloc(p->mounts, (p->mount_count + 1) * sizeof(char*));
+            if (m) {
+                p->mounts = m;
+                p->mounts[p->mount_count] = strdup(child_rel);
+                if (p->mounts[p->mount_count]) p->mount_count++;
+            }
+        }
+        if (S_ISDIR(st.st_mode)) {
+            int first = mark_folder_seen(p, (uint64_t)st.st_dev, (uint64_t)st.st_ino);
+            if (first < 0) {
+                rc = -1;
+                break;
+            }
+            if (!first) {
+                // Same folder reached by another path: its contents are already counted
+                p->revisits++;
+                printf("\033[33mAlready scanned, not counted again: %s\033[0m\n", child_full);
+                continue;
+            }
+            if (traverse_directory(p, child_full, child_rel, st.st_dev) != 0) {
+                rc = -1;
+                break;
+            }
         }
     }
 
@@ -2154,11 +2232,116 @@ static void find_hard_links(packer_t *p) {
             entry_t *e = &p->entries[idx[j]];
             e->link_to = idx[i];
             p->total_source_size -= e->size;   // never read twice
+            p->hardlink_bytes += e->size;
+            p->hardlink_names++;
             j++;
         }
         i = j;
     }
     free(idx);
+}
+
+typedef struct {
+    char name[256];
+    uint64_t bytes;
+} folder_total_t;
+
+static int cmp_folder_bytes(const void *a, const void *b) {
+    uint64_t x = ((const folder_total_t*)a)->bytes, y = ((const folder_total_t*)b)->bytes;
+    return x > y ? -1 : (x < y);
+}
+
+/* Exactly what will be packed: file data (each hard-linked file once), split
+ * by top-level folder, plus any other filesystems found inside the source. */
+static void print_scan_summary(packer_t *p) {
+    uint32_t files = 0, dirs = 0, symlinks = 0, other = 0;
+    folder_total_t *tops = NULL;
+    uint32_t top_count = 0, top_cap = 0;
+    uint64_t *mount_bytes = calloc(p->mount_count ? p->mount_count : 1, sizeof(uint64_t));
+
+    for (uint32_t i = 0; i < p->entry_count; i++) {
+        const entry_t *e = &p->entries[i];
+        if (S_ISDIR(e->mode)) { dirs++; continue; }
+        if (S_ISLNK(e->mode)) { symlinks++; continue; }
+        if (!S_ISREG(e->mode)) { other++; continue; }
+        files++;
+        if (e->link_to != NO_LINK) continue;   // data counted under the first name
+
+        // Top-level folder this file is in ("(files in the source folder)" for loose files)
+        const char *slash = strchr(e->rel_path, '/');
+        char top[256];
+        if (slash) {
+            size_t len = (size_t)(slash - e->rel_path);
+            if (len >= sizeof(top)) len = sizeof(top) - 1;
+            memcpy(top, e->rel_path, len);
+            top[len] = '\0';
+        } else {
+            snprintf(top, sizeof(top), "(files in the source folder)");
+        }
+        uint32_t t = 0;
+        while (t < top_count && strcmp(tops[t].name, top) != 0) t++;
+        if (t == top_count) {
+            if (top_count == top_cap) {
+                uint32_t cap = top_cap ? top_cap * 2 : 32;
+                folder_total_t *n = realloc(tops, cap * sizeof(folder_total_t));
+                if (!n) break;
+                tops = n;
+                top_cap = cap;
+            }
+            snprintf(tops[top_count].name, sizeof(tops[top_count].name), "%s", top);
+            tops[top_count].bytes = 0;
+            top_count++;
+        }
+        tops[t].bytes += e->size;
+
+        if (mount_bytes) {
+            for (uint32_t m = 0; m < p->mount_count; m++) {
+                size_t ml = strlen(p->mounts[m]);
+                if (strncmp(e->rel_path, p->mounts[m], ml) == 0 && e->rel_path[ml] == '/') {
+                    mount_bytes[m] += e->size;
+                }
+            }
+        }
+    }
+
+    char total[32], s[32];
+    format_size(p->total_source_size, total, sizeof(total));
+    printf("\033[32mFound %u files, %u folders, %u symlinks", files, dirs, symlinks);
+    if (other) printf(", %u special files", other);
+    printf(" - %s of file data (%" PRIu64 " bytes)\033[0m\n", total, p->total_source_size);
+    if (p->hardlink_names) {
+        format_size(p->hardlink_bytes, s, sizeof(s));
+        printf("\033[32m  %u paths are the same file as another path (hard links): %s counted once, not twice\033[0m\n",
+               p->hardlink_names, s);
+    }
+    if (p->revisits) {
+        printf("\033[33m  %u folders were reached twice (bind mounts) and counted once\033[0m\n", p->revisits);
+    }
+
+    if (tops) {
+        qsort(tops, top_count, sizeof(folder_total_t), cmp_folder_bytes);
+        printf("\033[32mLargest folders:\033[0m\n");
+        char shown[MAX_PATH_LEN];
+        for (uint32_t t = 0; t < top_count && t < 12; t++) {
+            format_size(tops[t].bytes, s, sizeof(s));
+            if (tops[t].name[0] == '(') snprintf(shown, sizeof(shown), "%s", tops[t].name);
+            else join_path(shown, sizeof(shown), p->source_root, tops[t].name, NULL);
+            printf("\033[32m  %12s  %s\033[0m\n", s, shown);
+        }
+    }
+
+    if (p->mount_count && mount_bytes) {
+        printf("\033[33mOther filesystems inside %s (packed too):\033[0m\n", p->source_root);
+        char shown[MAX_PATH_LEN];
+        for (uint32_t m = 0; m < p->mount_count; m++) {
+            format_size(mount_bytes[m], s, sizeof(s));
+            join_path(shown, sizeof(shown), p->source_root, p->mounts[m], NULL);
+            printf("\033[33m  %12s  %s\033[0m\n", s, shown);
+        }
+    }
+    fflush(stdout);
+    free(tops);
+    free(mount_bytes);
 }
 
 // a and b are ranks (positions in p->order)
@@ -2995,7 +3178,9 @@ static int cmd_create(int argc, char **argv) {
     printf("\033[32mScanning %s...\033[0m\n", p->source_root);
     fflush(stdout);
     int rc = 0;
-    if (add_entry(p, "", &root_st) != 0 || traverse_directory(p, p->source_root, "") != 0) {
+    if (add_entry(p, "", &root_st) != 0 ||
+        mark_folder_seen(p, (uint64_t)root_st.st_dev, (uint64_t)root_st.st_ino) < 0 ||
+        traverse_directory(p, p->source_root, "", root_st.st_dev) != 0) {
         fprintf(stderr, "\033[31mError: out of memory while scanning\033[0m\n");
         rc = 1;
     }
@@ -3011,6 +3196,7 @@ static int cmd_create(int argc, char **argv) {
                     p->order[p->order_count++] = i;
                 }
             }
+            print_scan_summary(p);
             g_sort = p;
             qsort(p->order, p->order_count, sizeof(uint32_t), cmp_stream_order);
             if (p->dedup) find_duplicates(p);
