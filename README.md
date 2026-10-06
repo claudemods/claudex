@@ -80,7 +80,7 @@ mkfs.claudex create [options] <source-dir> <image>
 | `--no-dedup` | Don't look for identical files. |
 | `-q` | No progress bar. |
 
-If `<image>` is an existing folder, the image is written inside it as `backup.claudex`. Otherwise `.claudex` is added to the name if it's missing. Any missing parent folders are created.
+If `<image>` is an existing folder, the image is written inside it as `root.claudex`. Otherwise `.claudex` is added to the name if it's missing. Any missing parent folders are created.
 
 Examples:
 
@@ -137,17 +137,23 @@ The image being written is never packed into itself.
 
 ## Booting a live system from an image
 
-`mkfs.claudex` can serve an image as the root filesystem of a live system. A writable RAM layer (overlayfs) goes on top, the same idea as the official Arch ISO's `airootfs`.
+`mkfs.claudex` plugs into the arch/miso-style live-boot hooks (`arch`, `arch_loop_mnt`, `arch_shutdown`, `arch_kms`). Those hooks still:
+
+- find the boot media
+- set up the cow space and copytoram
+- build the overlay root
+
+The `claudex` hook only changes how the root image is mounted. If `root.claudex` is found, it's mounted with `mkfs.claudex`. Otherwise the usual `rootfs.img` path runs unchanged.
 
 **1. Create the image of your system**
 
 ```bash
-sudo mkfs.claudex create / /path/to/root.claudex
+sudo mkfs.claudex create / /path/to/LiveOS/
 ```
 
-Recreate the image after kernel updates. The live system loads kernel modules from the image, so they must match the kernel on the ISO.
+That writes `/path/to/LiveOS/root.claudex`. Recreate the image after kernel updates. The live system loads kernel modules from the image, so they must match the kernel on the ISO.
 
-**2. Install the mkinitcpio hook**
+**2. Install the mkinitcpio hook and config**
 
 ```bash
 sudo mkfs.claudex initcpio                         # writes /etc/initcpio/{install,hooks}/claudex
@@ -155,32 +161,59 @@ sudo mkfs.claudex initcpio                         # writes /etc/initcpio/{insta
 mkfs.claudex initcpio myprofile/airootfs/etc/initcpio
 ```
 
-**3. Build the ISO's initramfs with the hook**
+The `arch*` hooks themselves are yours and must be installed alongside.
+
+This also writes `mkinitcpio.conf` in the **current directory**. An existing `mkinitcpio.conf` there is never overwritten, so delete it first to regenerate it. The generated file:
 
 ```
-HOOKS=(base udev modconf block filesystems keyboard claudex)
+MODULES=(loop btrfs dm-snapshot fuse overlay isofs)
+
+HOOKS=(base udev arch_shutdown arch arch_loop_mnt arch_kms
+        modconf block filesystems keyboard keymap claudex)
+
+COMPRESSION="zstd"
+
+COMPRESSION_OPTIONS=(--ultra -22)
 ```
 
-Don't use `autodetect`. It would limit the initramfs to the build machine's hardware. `mkfs.claudex` must be in `PATH` when mkinitcpio runs.
+`claudex` must come **after** `arch`. mkinitcpio loads hooks in order, so the claudex hook's `_mount_root_overlayfs` replaces the one from `arch`.
 
-**4. Kernel parameters**
+**3. Build the ISO's initramfs**
+
+```bash
+mkinitcpio -c ./mkinitcpio.conf -k /boot/vmlinuz-linux -g initramfs-linux.img
+```
+
+Don't add `autodetect`. It would limit the initramfs to the build machine's hardware. `mkfs.claudex` must be in `PATH` when mkinitcpio runs.
+
+**4. Put the image on the boot media**
+
+The image goes in `<root>/root.claudex` on the media, i.e. `/LiveOS/root.claudex` with the default `root=LiveOS`. Boot with the `arch` hook's usual parameters:
 
 | Parameter | Description |
 |---|---|
-| `claudex=<path>` | Path of the image on the boot media, e.g. `claudex=/arch/root.claudex` (required) |
-| `claudex_dev=<device>` | Device holding the image. Default: search every disk and optical drive. |
-| `claudex_copytoram=y` | Copy the image into RAM before mounting (needs more RAM than the image size) |
-| `cow_spacesize=<size>` | Size of the writable RAM layer, default `75%` |
+| `label=<label>` | Filesystem label of the boot media (the arch hook finds it as `/dev/disk/by-label/<label>`) |
+| `root=<dir>` | Folder on the media holding the image, default `LiveOS` |
+| `copytoram=y` | Copy the image into RAM before mounting (needs more RAM than the image size) |
+| `overlay_root_size=<size>` | Size of the writable RAM layer, default `75%` |
+| `img_dev=` / `img_label=` + `img_loop=` | Boot from an ISO file on another disk (`arch_loop_mnt`) |
 
-At boot the hook:
+At boot:
 
-1. finds the boot media
-2. mounts the image with `mkfs.claudex mount --rootfs`
-3. layers a tmpfs on top with overlayfs
+1. `arch` mounts the boot media and the RAM layers.
+2. The claudex hook mounts `root.claudex` with `mkfs.claudex mount --rootfs`.
+3. `arch` puts the overlay root on top.
 
 The image is used exactly as packed. `/etc/fstab` is left out by the default excludes.
 
-The FUSE process names itself with a leading `@`, so systemd leaves it running until the very end of shutdown.
+The FUSE process names itself with a leading `@`, so systemd leaves it running until the very end of shutdown, when `arch_shutdown` takes over. `arch_shutdown` should unmount the claudex image after the `/oldroot` mounts and before the boot device:
+
+```sh
+# Unmount claudex images (stops mkfs.claudex so the boot device can be released).
+for _cx in /oldrun/arch/claudex/*; do
+    mountpoint -q "${_cx}" && umount "${_cx}"
+done
+```
 
 ---
 

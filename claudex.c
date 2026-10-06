@@ -2924,7 +2924,7 @@ static int cmd_create(int argc, char **argv) {
         return 1;
     }
 
-    // An existing folder gets backup.claudex inside it; otherwise add .claudex if missing
+    // An existing folder gets root.claudex inside it; otherwise add .claudex if missing
     char final_output[MAX_PATH_LEN];
     char out_dir[MAX_PATH_LEN];
     snprintf(out_dir, sizeof(out_dir), "%s", output);
@@ -2932,7 +2932,7 @@ static int cmd_create(int argc, char **argv) {
     size_t out_len = strlen(out_dir);
     struct stat out_dir_st;
     if (stat(out_dir, &out_dir_st) == 0 && S_ISDIR(out_dir_st.st_mode)) {
-        join_path(final_output, sizeof(final_output), out_dir, "backup.claudex", NULL);
+        join_path(final_output, sizeof(final_output), out_dir, "root.claudex", NULL);
     } else if (out_len < 8 || strcmp(out_dir + out_len - 8, ".claudex") != 0) {
         snprintf(final_output, sizeof(final_output), "%s.claudex", out_dir);
     } else {
@@ -3894,106 +3894,114 @@ static int cmd_mount(int argc, char **argv, char *prog) {
  *  Boot support: mkinitcpio hook
  * ===================================================================== */
 
-// Copied into the initramfs build: what to include
+/* The hooks follow the arch/miso live-boot hooks: the 'arch' hook finds the
+ * boot media (label=), sets up cow space, copytoram and the overlay root, and
+ * calls _mount_root_overlayfs for each image in ${root}/ (default LiveOS).
+ * The claudex hook comes after 'arch' in HOOKS, so its _mount_root_overlayfs
+ * replaces the original: it mounts ${root}/root.claudex when present and
+ * otherwise does exactly what the arch hook would with rootfs.img. */
+
+// install/claudex: what goes into the initramfs
 static const char initcpio_install[] =
     "#!/bin/bash\n"
-    "# claudex: boot from a .claudex image (installed by 'mkfs.claudex initcpio')\n"
     "\n"
     "build() {\n"
-    "    add_module fuse\n"
-    "    add_module overlay\n"
-    "    add_module isofs\n"
-    "    add_module loop\n"
-    "    add_binary mkfs.claudex /usr/bin/mkfs.claudex\n"
+    "    add_module \"fuse\"\n"
+    "    add_module \"overlay\"\n"
+    "    add_module \"loop\"\n"
+    "\n"
     "    add_runscript\n"
+    "\n"
+    "    add_binary mkfs.claudex\n"
     "}\n"
     "\n"
     "help() {\n"
-    "    cat <<'HELPEOF'\n"
-    "Mounts a .claudex image as the root filesystem with a writable RAM layer\n"
-    "on top. Use with: HOOKS=(base udev modconf block filesystems keyboard claudex)\n"
-    "\n"
-    "Kernel parameters:\n"
-    "  claudex=<path>        image path on the boot media, e.g. claudex=/arch/root.claudex\n"
-    "  claudex_dev=<device>  device holding the image (default: search every disk)\n"
-    "  claudex_copytoram=y   copy the image into RAM first (needs RAM > image size)\n"
-    "  cow_spacesize=<size>  size of the writable RAM layer (default 75%)\n"
+    "    cat <<HELPEOF\n"
+    "Boots the live system from a claudex image. Works with the arch hook and must\n"
+    "come after it in HOOKS: if <root>/root.claudex exists on the boot media\n"
+    "(root= defaults to LiveOS) it is mounted with mkfs.claudex instead of\n"
+    "rootfs.img. All arch hook options (label=, copytoram=y, cow_*) still apply.\n"
     "HELPEOF\n"
-    "}\n";
+    "}\n"
+    "\n"
+    "# vim: set ft=sh ts=4 sw=4 et:\n";
 
-// Runs inside the initramfs at boot
+// hooks/claudex: runs inside the initramfs at boot
 static const char initcpio_hook[] =
-    "#!/usr/bin/ash\n"
-    "# claudex: boot from a .claudex image (installed by 'mkfs.claudex initcpio')\n"
+    "# args: /path/to/image_file, mountpoint\n"
+    "_mnt_claudex() {\n"
+    "    local img=\"${1}\"\n"
+    "    local mnt=\"${2}\"\n"
+    "    local img_fullname=\"${img##*/}\"\n"
+    "    local oper=$( [[ -n \"${ip}\" && -n \"${miso_http_srv}\" ]] && echo \"mv\" || echo \"cp\" )\n"
     "\n"
-    "run_hook() {\n"
-    "    if [ -n \"${claudex}\" ]; then\n"
-    "        export mount_handler=\"claudex_mount_handler\"\n"
-    "    fi\n"
-    "}\n"
-    "\n"
-    "_claudex_try() {\n"
-    "    [ -b \"$1\" ] || return 1\n"
-    "    mount -r \"$1\" /run/claudex/bootmnt 2>/dev/null || return 1\n"
-    "    [ -f \"/run/claudex/bootmnt${claudex}\" ] && return 0\n"
-    "    umount /run/claudex/bootmnt\n"
-    "    return 1\n"
-    "}\n"
-    "\n"
-    "_claudex_find() {\n"
-    "    local dev\n"
-    "    if [ -n \"${claudex_dev}\" ]; then\n"
-    "        _claudex_try \"${claudex_dev}\"\n"
-    "        return\n"
-    "    fi\n"
-    "    for dev in /dev/sr* /dev/sd* /dev/nvme* /dev/vd* /dev/mmcblk*; do\n"
-    "        _claudex_try \"$dev\" && return 0\n"
-    "    done\n"
-    "    return 1\n"
-    "}\n"
-    "\n"
-    "claudex_mount_handler() {\n"
-    "    local newroot=\"$1\" img tries=0\n"
-    "    mkdir -p /run/claudex/bootmnt /run/claudex/lower /run/claudex/cow\n"
-    "    modprobe -a -q fuse overlay isofs loop >/dev/null 2>&1\n"
-    "\n"
-    "    msg \":: Looking for ${claudex}...\"\n"
-    "    until _claudex_find; do\n"
-    "        tries=$((tries + 1))\n"
-    "        if [ \"$tries\" -ge 30 ]; then\n"
-    "            err \"claudex: ${claudex} not found on any device\"\n"
+    "    if [[ \"${copytoram}\" == \"y\" ]]; then\n"
+    "        msg -n \":: Copying claudex image to RAM...\"\n"
+    "        if ! \"${oper}\" \"${img}\" \"${cp2ram}/${img_fullname}\" ; then\n"
+    "            echo \"ERROR: while copy '${img}' to '${cp2ram}/${img_fullname}'\"\n"
     "            launch_interactive_shell\n"
-    "            tries=0\n"
     "        fi\n"
-    "        sleep 1\n"
-    "    done\n"
-    "    img=\"/run/claudex/bootmnt${claudex}\"\n"
-    "\n"
-    "    if [ \"${claudex_copytoram}\" = \"y\" ]; then\n"
-    "        msg \":: Copying ${claudex} to RAM...\"\n"
-    "        mkdir -p /run/claudex/ram\n"
-    "        mount -t tmpfs -o size=100% claudex_ram /run/claudex/ram\n"
-    "        if cp \"$img\" /run/claudex/ram/root.claudex; then\n"
-    "            img=/run/claudex/ram/root.claudex\n"
-    "            umount /run/claudex/bootmnt 2>/dev/null\n"
-    "        else\n"
-    "            rm -f /run/claudex/ram/root.claudex\n"
-    "            umount /run/claudex/ram\n"
-    "        fi\n"
+    "        img=\"${cp2ram}/${img_fullname}\"\n"
+    "        msg \"done.\"\n"
     "    fi\n"
     "\n"
-    "    msg \":: Mounting ${claudex}...\"\n"
-    "    if ! mkfs.claudex mount \"$img\" /run/claudex/lower --rootfs; then\n"
-    "        err \"claudex: cannot mount $img\"\n"
+    "    mkdir -p \"${mnt}\"\n"
+    "\n"
+    "    msg \":: Mounting '${img}' to '${mnt}'\"\n"
+    "\n"
+    "    if mkfs.claudex mount \"${img}\" \"${mnt}\" --rootfs; then\n"
+    "        msg \":: Image '${img}' mounted successfully.\"\n"
+    "    else\n"
+    "        echo \"ERROR; Failed to mount '${img}'\"\n"
+    "        echo \"   Falling back to interactive prompt\"\n"
+    "        echo \"   You can try to fix the problem manually, log out when you are finished\"\n"
     "        launch_interactive_shell\n"
     "    fi\n"
+    "}\n"
     "\n"
-    "    # Writable RAM layer on top of the read-only image\n"
-    "    mount -t tmpfs -o \"size=${cow_spacesize:-75%},mode=0755\" claudex_cow /run/claudex/cow\n"
-    "    mkdir -p /run/claudex/cow/upper /run/claudex/cow/work\n"
-    "    mount -t overlay -o lowerdir=/run/claudex/lower,upperdir=/run/claudex/cow/upper,workdir=/run/claudex/cow/work \\\n"
-    "        claudex_root \"$newroot\"\n"
-    "}\n";
+    "# Replaces the arch hook's version: root.claudex is used when present,\n"
+    "# otherwise the image is handled exactly as before.\n"
+    "_mount_root_overlayfs() {\n"
+    "    local sfs=\"${1}\"\n"
+    "    local src=\"${bootmnt}/${root}\"\n"
+    "    local dest_sfs=\"${live_root}/sfs\"\n"
+    "    local dest_img=\"${live_root}/img\"\n"
+    "    local cx=\"${src}/${sfs}.claudex\"\n"
+    "\n"
+    "    [[ \"${sfs}\" == \"rootfs\" ]] && cx=\"${src}/root.claudex\"\n"
+    "\n"
+    "    if [[ -f \"${cx}\" ]]; then\n"
+    "        _mnt_claudex \"${cx}\" \"${live_root}/claudex/${sfs}\"\n"
+    "        lower_dir=$(_gen_arg \"${live_root}/claudex/${sfs}\")\n"
+    "    elif [[ -f \"${src}/${sfs}.img\" ]]; then\n"
+    "        _mnt_sfs \"${src}/${sfs}.img\" \"${dest_sfs}/${sfs}\"\n"
+    "        local find_img=\"${dest_sfs}/${sfs}/LiveOS/${sfs}.img\"\n"
+    "        if [[ -f \"${find_img}\" ]]; then\n"
+    "            mkdir -p ${dest_img}\n"
+    "            lower_dir=$(_gen_arg \"${dest_img}/${sfs}\")\n"
+    "            _mnt_dmsnapshot \"${find_img}\" \"${dest_img}/${sfs}\"\n"
+    "        else\n"
+    "            lower_dir=$(_gen_arg \"${dest_sfs}/${sfs}\")\n"
+    "        fi\n"
+    "    fi\n"
+    "}\n"
+    "\n"
+    "# vim:ft=sh:ts=4:sw=4:et:\n";
+
+// mkinitcpio config for the ISO's initramfs. claudex must come after arch.
+static const char initcpio_conf[] =
+    "# mkinitcpio config for booting a claudex image (written by 'mkfs.claudex initcpio')\n"
+    "# Build the initramfs with:\n"
+    "#   mkinitcpio -c <this file> -k /boot/vmlinuz-linux -g initramfs-linux.img\n"
+    "\n"
+    "MODULES=(loop btrfs dm-snapshot fuse overlay isofs)\n"
+    "\n"
+    "HOOKS=(base udev arch_shutdown arch arch_loop_mnt arch_kms\n"
+    "        modconf block filesystems keyboard keymap claudex)\n"
+    "\n"
+    "COMPRESSION=\"zstd\"\n"
+    "\n"
+    "COMPRESSION_OPTIONS=(--ultra -22)\n";
 
 static int write_file_text(const char *path, const char *text) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -4015,8 +4023,23 @@ static int cmd_initcpio(const char *dir) {
         if (write_file_text(path, texts[i]) != 0) goto fail;
         printf("\033[32mWrote %s\033[0m\n", path);
     }
-    printf("\033[32mAdd 'claudex' to HOOKS (after 'filesystems') in the mkinitcpio config for your ISO's initramfs,\n"
-           "and boot with the kernel parameter claudex=/path/to/image.claudex (path on the boot media).\n"
+
+    // mkinitcpio.conf goes in the current directory. Never overwrite one that
+    // may have been edited since.
+    snprintf(path, sizeof(path), "mkinitcpio.conf");
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        printf("\033[33mKept existing ./%s (delete it to regenerate)\033[0m\n", path);
+    } else {
+        if (write_file_text(path, initcpio_conf) != 0) {
+            fprintf(stderr, "\033[31mError: cannot write ./mkinitcpio.conf: %s\033[0m\n", strerror(errno));
+            return 1;
+        }
+        printf("\033[32mWrote ./%s\033[0m\n", path);
+    }
+
+    printf("\033[32mBuild the ISO's initramfs with ./mkinitcpio.conf (claudex after arch in HOOKS) and put\n"
+           "the image on the boot media as <root>/root.claudex (root= defaults to LiveOS).\n"
            "mkfs.claudex must be in PATH when mkinitcpio runs (sudo make install).\033[0m\n");
     return 0;
 
@@ -4049,7 +4072,8 @@ static void usage(void) {
         "  mkfs.claudex list <image>                         list contents\n"
         "  mkfs.claudex info <image>                         image statistics\n"
         "  mkfs.claudex initcpio [dir]                       install the boot hook for mkinitcpio\n"
-        "                                                    (default dir: /etc/initcpio)\n");
+        "                                                    (default dir: /etc/initcpio) and write\n"
+        "                                                    ./mkinitcpio.conf\n");
 }
 
 int main(int argc, char **argv) {
