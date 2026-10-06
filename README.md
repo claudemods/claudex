@@ -129,7 +129,7 @@ These are skipped unless you pass `--no-default-excludes`. Each path is only exc
 | `/home/*/.cache` `/root/.cache` | Application caches |
 | `/var/log/journal` `/var/lib/systemd/coredump` | Logs and crash dumps |
 | `/etc/fstab` | Lists the original machine's disks, which won't exist when the image is booted elsewhere |
-| any file named `backup.claudex` | Older images |
+| any file named `root.claudex` or `backup.claudex` | Older images |
 
 The image being written is never packed into itself.
 

@@ -1693,6 +1693,7 @@ static const char *default_excludes[] = {
 
 // Entries with these names are skipped wherever they appear
 static const char *default_exclude_names[] = {
+    "root.claudex",
     "backup.claudex",
     NULL
 };
@@ -4062,7 +4063,7 @@ static void usage(void) {
         "      -T <n>                 threads (default: all CPUs)\n"
         "      --exclude=<path>       skip a path or pattern (in addition to the defaults)\n"
         "      --no-default-excludes  don't skip /proc /sys /dev /run /tmp /mnt /media, caches, logs,\n"
-        "                             the pacman package cache, /etc/fstab or backup.claudex\n"
+        "                             the pacman package cache, /etc/fstab, root.claudex or backup.claudex\n"
         "      --no-dedup             don't look for identical files\n"
         "      -q                     no progress bar\n"
         "  mkfs.claudex mount <image> <dir> [-f] [-o opts]   mount read-only (unmount: fusermount3 -u <dir>)\n"
