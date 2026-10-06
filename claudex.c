@@ -1616,6 +1616,7 @@ static const char *default_excludes[] = {
     "/mnt", "/media", "/lost+found", "/swapfile", "/swap.img",
     "/var/cache/pacman/pkg", "/var/log/journal", "/var/lib/systemd/coredump",
     "/home/*/.cache", "/root/.cache",
+    "/etc/fstab",
     NULL
 };
 
@@ -3636,12 +3637,6 @@ static const char initcpio_hook[] =
     "    mkdir -p /run/claudex/cow/upper /run/claudex/cow/work\n"
     "    mount -t overlay -o lowerdir=/run/claudex/lower,upperdir=/run/claudex/cow/upper,workdir=/run/claudex/cow/work \\\n"
     "        claudex_root \"$newroot\"\n"
-    "\n"
-    "    # The installed system's fstab names disks that are not there when booted live\n"
-    "    if [ -f \"$newroot/etc/fstab\" ]; then\n"
-    "        mv \"$newroot/etc/fstab\" \"$newroot/etc/fstab.claudex\"\n"
-    "        echo \"# claudex live root - the original fstab is /etc/fstab.claudex\" > \"$newroot/etc/fstab\"\n"
-    "    fi\n"
     "}\n";
 
 static int write_file_text(const char *path, const char *text) {
@@ -3688,7 +3683,7 @@ static void usage(void) {
         "      -T <n>                 threads (default: all CPUs)\n"
         "      --exclude=<path>       skip a path or pattern (in addition to the defaults)\n"
         "      --no-default-excludes  don't skip /proc /sys /dev /run /tmp /mnt /media, caches, logs,\n"
-        "                             the pacman package cache or backup.claudex\n"
+        "                             the pacman package cache, /etc/fstab or backup.claudex\n"
         "      --no-dedup             don't look for identical files\n"
         "      -q                     no progress bar\n"
         "  claudex mount <image> <dir> [-f] [-o opts]   mount read-only (unmount: fusermount3 -u <dir>)\n"
