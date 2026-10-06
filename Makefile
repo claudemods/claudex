@@ -5,10 +5,10 @@ FUSE = $(shell pkg-config --cflags --libs fuse3)
 claudex: claudex.c
 	$(CC) $(CFLAGS) -o $@ claudex.c $(FUSE)
 
-install: claudex
-	install -m 755 claudex /usr/local/bin/
+install: mkfs.claudex
+	install -m 755 mkfs.claudex /usr/local/bin/
 
 clean:
-	rm -f claudex
+	rm -f mkfs.claudex
 
 .PHONY: install clean
