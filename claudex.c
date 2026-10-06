@@ -18,7 +18,7 @@
  * lazy matching; levels 8-9 use price-based optimal parsing. Blocks of x86
  * machine code go through a CALL-address filter first.
  *
- * Image format, version 4 (all integers little-endian)
+ * Image format, version 6 (all integers little-endian)
  *
  *   header        96 bytes, see header_encode()
  *   data blocks   the contents of every regular file concatenated into one
@@ -30,10 +30,16 @@
  *   metadata      chunks of { uint32 raw_len, uint32 stored_len, uint8 type, data }
  *                 that decode to node_count entries of:
  *                   uint32 path_len, path bytes   (relative, "" = root directory)
- *                   uint32 mode, uint32 uid, uint32 gid, int64 mtime
- *                   S_IFREG: uint64 data_offset, uint64 size, uint32 crc32
+ *                   uint32 mode, uint32 uid, uint32 gid,
+ *                   int64 mtime, uint32 mtime_nsec, int64 atime, uint32 atime_nsec
+ *                   S_IFREG: uint64 data_offset, uint64 size, uint32 crc32,
+ *                            uint32 hard_link (index of an earlier entry this
+ *                            is a hard link to, or 0xFFFFFFFF)
  *                   S_IFLNK: uint32 target_len, target bytes
  *                   S_IFCHR/S_IFBLK/S_IFIFO/S_IFSOCK: uint64 rdev
+ *                   uint32 xattr_count, then per extended attribute (ACLs,
+ *                   capabilities, labels...): uint32 name_len, name,
+ *                   uint32 value_len, value
  *                 Parents always precede their contents.
  *   footer        "CLDE" uint32 node_count
  *
@@ -63,10 +69,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/statvfs.h>
+#include <sys/xattr.h>
 
 #define MAGIC              "CLDX"
 #define FOOTER_MAGIC       "CLDE"
-#define FORMAT_VERSION     4
+#define FORMAT_VERSION     6
+#define NO_LINK            UINT32_MAX
 #define HEADER_SIZE        96
 #define BLOCK_ENTRY_SIZE   16
 #define CHUNK_HEADER_SIZE  9
@@ -1171,13 +1179,35 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     int64_t mtime;
+    uint32_t mtime_nsec;
+    int64_t atime;
+    uint32_t atime_nsec;
     uint64_t data_off;          // regular files
     uint64_t size;
     uint32_t crc;
+    uint32_t link;              // hard link: index of an earlier regular-file entry, or NO_LINK
     const char *target;         // symlinks, not NUL-terminated
     uint32_t target_len;
     uint64_t rdev;              // device nodes
+    uint32_t xattr_count;       // extended attributes (ACLs, capabilities, ...)
+    const uint8_t *xattrs;      // first record, walk with xattr_next()
 } meta_entry_t;
+
+#define XATTR_NAME_MAX_LEN  255
+#define XATTR_VALUE_MAX_LEN 65536
+
+/* Reads one extended-attribute record (already validated by meta_next).
+ * Copies the NUL-terminated name into name[XATTR_NAME_MAX_LEN + 1] and
+ * returns a pointer to the next record. */
+static const uint8_t* xattr_next(const uint8_t *rec, char *name, const uint8_t **value, uint32_t *value_len) {
+    uint32_t name_len = get_le32(rec);
+    memcpy(name, rec + 4, name_len);
+    name[name_len] = '\0';
+    rec += 4 + name_len;
+    *value_len = get_le32(rec);
+    *value = rec + 4;
+    return rec + 4 + *value_len;
+}
 
 typedef struct {
     int fd;
@@ -1302,19 +1332,25 @@ static int meta_next(const image_t *img, size_t *pos, meta_entry_t *e) {
     if (memchr(e->path, '\0', e->path_len) != NULL) return -1;
     p += e->path_len;
 
-    NEED(20);
+    NEED(36);
     e->mode = get_le32(m + p);
     e->uid = get_le32(m + p + 4);
     e->gid = get_le32(m + p + 8);
     e->mtime = (int64_t)get_le64(m + p + 12);
-    p += 20;
+    e->mtime_nsec = get_le32(m + p + 20);
+    e->atime = (int64_t)get_le64(m + p + 24);
+    e->atime_nsec = get_le32(m + p + 32);
+    p += 36;
+    if (e->mtime_nsec >= 1000000000u || e->atime_nsec >= 1000000000u) return -1;
 
+    e->link = NO_LINK;
     if (S_ISREG(e->mode)) {
-        NEED(20);
+        NEED(24);
         e->data_off = get_le64(m + p);
         e->size = get_le64(m + p + 8);
         e->crc = get_le32(m + p + 16);
-        p += 20;
+        e->link = get_le32(m + p + 20);
+        p += 24;
         if (e->size > img->h.data_size || e->data_off > img->h.data_size - e->size) return -1;
     } else if (S_ISLNK(e->mode)) {
         NEED(4);
@@ -1329,6 +1365,26 @@ static int meta_next(const image_t *img, size_t *pos, meta_entry_t *e) {
         NEED(8);
         e->rdev = get_le64(m + p);
         p += 8;
+    }
+
+    NEED(4);
+    e->xattr_count = get_le32(m + p);
+    p += 4;
+    e->xattrs = m + p;
+    for (uint32_t i = 0; i < e->xattr_count; i++) {
+        NEED(4);
+        uint32_t name_len = get_le32(m + p);
+        p += 4;
+        if (name_len == 0 || name_len > XATTR_NAME_MAX_LEN) return -1;
+        NEED(name_len);
+        if (memchr(m + p, '\0', name_len) != NULL) return -1;
+        p += name_len;
+        NEED(4);
+        uint32_t value_len = get_le32(m + p);
+        p += 4;
+        if (value_len > XATTR_VALUE_MAX_LEN) return -1;
+        NEED(value_len);
+        p += value_len;
     }
 #undef NEED
 
@@ -1470,12 +1526,27 @@ static int image_open(image_t *img, const char *path, char *err, size_t err_len)
         goto fail;
     }
 
-    // Walk the metadata once so later users can trust it
+    // Walk the metadata once so later users can trust it. A hard link must
+    // point at an earlier regular file that is not itself a link.
     size_t pos = 0;
     uint32_t count = 0;
     meta_entry_t e;
     int r;
-    while ((r = meta_next(img, &pos, &e)) == 1) count++;
+    uint8_t *is_target = calloc(h->node_count ? h->node_count : 1, 1);
+    if (!is_target) {
+        snprintf(err, err_len, "out of memory");
+        goto fail;
+    }
+    while ((r = meta_next(img, &pos, &e)) == 1) {
+        if (count >= h->node_count) break;
+        if (e.link != NO_LINK && (e.link >= count || !is_target[e.link])) {
+            r = -1;
+            break;
+        }
+        is_target[count] = S_ISREG(e.mode) && e.link == NO_LINK;
+        count++;
+    }
+    free(is_target);
     if (r != 0 || count != h->node_count) {
         snprintf(err, err_len, "metadata is corrupt");
         goto fail;
@@ -1633,11 +1704,15 @@ typedef struct {
     uint64_t size;          // from stat; after packing, the bytes actually stored
     uint64_t data_off;
     uint64_t rdev;
-    int64_t mtime;
+    int64_t mtime, atime;
+    uint32_t mtime_nsec, atime_nsec;
     uint32_t mode, uid, gid;
     uint32_t crc;
     uint32_t dup_of;        // entry index of an identical file, or NO_DUP
     uint32_t pre_crc;       // checksum from the duplicate scan
+    uint32_t link_to;       // entry index of the first name of this hard-linked file, or NO_LINK
+    uint64_t dev, ino;      // identity, to find hard links
+    uint8_t multi_link;     // st_nlink > 1
     uint8_t pre_ok;
     uint8_t skipped;
 } entry_t;
@@ -1949,10 +2024,17 @@ static int add_entry(packer_t *p, const char *rel_path, const struct stat *st) {
     e->mode = st->st_mode;
     e->uid = st->st_uid;
     e->gid = st->st_gid;
-    e->mtime = st->st_mtime;
+    e->mtime = st->st_mtim.tv_sec;
+    e->mtime_nsec = (uint32_t)st->st_mtim.tv_nsec;
+    e->atime = st->st_atim.tv_sec;
+    e->atime_nsec = (uint32_t)st->st_atim.tv_nsec;
     e->rdev = st->st_rdev;
     e->size = S_ISREG(st->st_mode) ? (uint64_t)st->st_size : 0;
     e->dup_of = NO_DUP;
+    e->link_to = NO_LINK;
+    e->dev = (uint64_t)st->st_dev;
+    e->ino = (uint64_t)st->st_ino;
+    e->multi_link = S_ISREG(st->st_mode) && st->st_nlink > 1;
     p->entry_count++;
     if (S_ISREG(st->st_mode)) p->total_source_size += e->size;
     return 0;
@@ -2042,6 +2124,40 @@ static int cmp_stream_order(const void *a, const void *b) {
     c = strcmp(bx, by);
     if (c) return c;
     return strcmp(x->rel_path, y->rel_path);
+}
+
+static int cmp_inode(const void *a, const void *b) {
+    uint32_t ia = *(const uint32_t*)a, ib = *(const uint32_t*)b;
+    const entry_t *x = &g_sort->entries[ia];
+    const entry_t *y = &g_sort->entries[ib];
+    if (x->dev != y->dev) return x->dev < y->dev ? -1 : 1;
+    if (x->ino != y->ino) return x->ino < y->ino ? -1 : 1;
+    return ia < ib ? -1 : (ia > ib);
+}
+
+// Names that are hard links to the same file: store the data once and
+// restore them as hard links. The first name in scan order owns the data.
+static void find_hard_links(packer_t *p) {
+    uint32_t *idx = malloc((size_t)(p->entry_count ? p->entry_count : 1) * sizeof(uint32_t));
+    if (!idx) return;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < p->entry_count; i++) {
+        if (p->entries[i].multi_link) idx[n++] = i;
+    }
+    g_sort = p;
+    qsort(idx, n, sizeof(uint32_t), cmp_inode);
+    for (uint32_t i = 0; i < n;) {
+        entry_t *first = &p->entries[idx[i]];
+        uint32_t j = i + 1;
+        while (j < n && p->entries[idx[j]].dev == first->dev && p->entries[idx[j]].ino == first->ino) {
+            entry_t *e = &p->entries[idx[j]];
+            e->link_to = idx[i];
+            p->total_source_size -= e->size;   // never read twice
+            j++;
+        }
+        i = j;
+    }
+    free(idx);
 }
 
 // a and b are ranks (positions in p->order)
@@ -2434,19 +2550,89 @@ static void writer_loop(packer_t *p) {
     }
 }
 
+/* Appends the extended attributes of path (ACLs, capabilities, labels...)
+ * without following symlinks: a count, then name/value records. */
+static void put_xattrs(packer_t *p, buf_t *m, const char *path, uint8_t *value) {
+    size_t count_pos = m->len;
+    uint32_t count = 0;
+    buf_u32(m, 0);
+
+    ssize_t list_len = llistxattr(path, NULL, 0);
+    if (list_len < 0 && errno != ENOTSUP && errno != ENODATA) {
+        warnf(p, "cannot list attributes of %s: %s", path, strerror(errno));
+    }
+    if (list_len <= 0) return;
+
+    char *list = malloc((size_t)list_len + 1);
+    if (!list) {
+        m->error = 1;
+        return;
+    }
+    list_len = llistxattr(path, list, (size_t)list_len);
+    if (list_len < 0) {
+        warnf(p, "cannot list attributes of %s: %s", path, strerror(errno));
+        free(list);
+        return;
+    }
+    list[list_len] = '\0';
+
+    for (char *name = list; name < list + list_len; name += strlen(name) + 1) {
+        size_t name_len = strlen(name);
+        if (name_len == 0 || name_len > XATTR_NAME_MAX_LEN) continue;
+        ssize_t value_len = lgetxattr(path, name, value, XATTR_VALUE_MAX_LEN);
+        if (value_len < 0) {
+            warnf(p, "cannot read attribute %s of %s: %s", name, path, strerror(errno));
+            continue;
+        }
+        buf_u32(m, (uint32_t)name_len);
+        buf_put(m, name, name_len);
+        buf_u32(m, (uint32_t)value_len);
+        buf_put(m, value, (size_t)value_len);
+        count++;
+    }
+    free(list);
+    if (!m->error) put_le32(m->p + count_pos, count);
+}
+
 static int build_metadata(packer_t *p, buf_t *m, uint32_t *count, uint64_t *original) {
     char path[MAX_PATH_LEN];
     char target[MAX_PATH_LEN];
     *count = 0;
     *original = 0;
 
+    // Position of each entry in the metadata (skipped entries are left out)
+    uint32_t *meta_index = malloc((size_t)(p->entry_count ? p->entry_count : 1) * sizeof(uint32_t));
+    uint8_t *xattr_value = malloc(XATTR_VALUE_MAX_LEN);
+    if (!meta_index || !xattr_value) {
+        free(meta_index);
+        free(xattr_value);
+        return -1;
+    }
+
     for (uint32_t i = 0; i < p->entry_count; i++) {
         entry_t *e = &p->entries[i];
+        meta_index[i] = NO_LINK;
         if (e->skipped) continue;
 
+        // A hard link takes its data from the first name of the file
+        uint32_t link = NO_LINK;
+        if (S_ISREG(e->mode) && e->link_to != NO_LINK) {
+            const entry_t *first = &p->entries[e->link_to];
+            if (first->skipped || meta_index[e->link_to] == NO_LINK) {
+                source_path(p, e, path, sizeof(path));
+                warnf(p, "%s is a hard link to a file that could not be read (skipped)", path);
+                e->skipped = 1;
+                continue;
+            }
+            link = meta_index[e->link_to];
+            e->data_off = first->data_off;
+            e->size = first->size;
+            e->crc = first->crc;
+        }
+
+        source_path(p, e, path, sizeof(path));
         ssize_t tlen = 0;
         if (S_ISLNK(e->mode)) {
-            source_path(p, e, path, sizeof(path));
             tlen = readlink(path, target, sizeof(target));
             if (tlen < 0 || tlen >= (ssize_t)sizeof(target)) {
                 warnf(p, "cannot read symlink %s (skipped)", path);
@@ -2462,10 +2648,14 @@ static int build_metadata(packer_t *p, buf_t *m, uint32_t *count, uint64_t *orig
         buf_u32(m, e->uid);
         buf_u32(m, e->gid);
         buf_u64(m, (uint64_t)e->mtime);
+        buf_u32(m, e->mtime_nsec);
+        buf_u64(m, (uint64_t)e->atime);
+        buf_u32(m, e->atime_nsec);
         if (S_ISREG(e->mode)) {
             buf_u64(m, e->data_off);
             buf_u64(m, e->size);
             buf_u32(m, e->crc);
+            buf_u32(m, link);
             *original += e->size;
         } else if (S_ISLNK(e->mode)) {
             buf_u32(m, (uint32_t)tlen);
@@ -2473,8 +2663,16 @@ static int build_metadata(packer_t *p, buf_t *m, uint32_t *count, uint64_t *orig
         } else if (!S_ISDIR(e->mode)) {
             buf_u64(m, e->rdev);
         }
+        if (link == NO_LINK) {
+            put_xattrs(p, m, path, xattr_value);
+        } else {
+            buf_u32(m, 0);   // a hard link shares the attributes of its first name
+        }
+        meta_index[i] = *count;
         (*count)++;
     }
+    free(meta_index);
+    free(xattr_value);
     return m->error ? -1 : 0;
 }
 
@@ -2806,8 +3004,11 @@ static int cmd_create(int argc, char **argv) {
         if (!p->order) {
             rc = 1;
         } else {
+            find_hard_links(p);
             for (uint32_t i = 0; i < p->entry_count; i++) {
-                if (S_ISREG(p->entries[i].mode)) p->order[p->order_count++] = i;
+                if (S_ISREG(p->entries[i].mode) && p->entries[i].link_to == NO_LINK) {
+                    p->order[p->order_count++] = i;
+                }
             }
             g_sort = p;
             qsort(p->order, p->order_count, sizeof(uint32_t), cmp_stream_order);
@@ -2841,12 +3042,62 @@ typedef struct {
     char *path;
     char *target;
     uint32_t mode, uid, gid;
-    int64_t mtime;
+    int64_t mtime, atime;
+    uint32_t mtime_nsec, atime_nsec;
     uint64_t data_off, size, rdev;
     uint32_t crc;
+    uint32_t link;          // hard link to this earlier entry, or NO_LINK
+    uint32_t xattr_count;
+    const uint8_t *xattrs;  // points into the image's metadata
 } xentry_t;
 
 static uint32_t error_count;
+static uint32_t restore_warnings;
+
+static void restore_warn(const char *path, const char *what) {
+    restore_warnings++;
+    fprintf(stderr, "\033[33mWarning: %s: cannot restore %s: %s\033[0m\n", path, what, strerror(errno));
+}
+
+/* Puts back owner, extended attributes (ACLs, capabilities...), permissions
+ * and timestamps. Order matters: changing the owner clears capabilities, and
+ * attributes must be set while the file is still writable. Uses fd when
+ * given, otherwise the path itself (never following a symlink). */
+static void restore_meta(const xentry_t *x, const char *full, int fd, int is_root) {
+    int is_link = S_ISLNK(x->mode);
+
+    if (is_root && (fd >= 0 ? fchown(fd, x->uid, x->gid) : lchown(full, x->uid, x->gid)) != 0) {
+        restore_warn(x->path, "owner");
+    }
+
+    const uint8_t *rec = x->xattrs;
+    char name[XATTR_NAME_MAX_LEN + 1];
+    for (uint32_t i = 0; i < x->xattr_count; i++) {
+        const uint8_t *value;
+        uint32_t value_len;
+        rec = xattr_next(rec, name, &value, &value_len);
+        int r = fd >= 0 ? fsetxattr(fd, name, value, value_len, 0)
+                        : lsetxattr(full, name, value, value_len, 0);
+        if (r != 0) {
+            char what[XATTR_NAME_MAX_LEN + 16];
+            snprintf(what, sizeof(what), "attribute %s", name);
+            restore_warn(x->path, what);
+        }
+    }
+
+    if (!is_link && (fd >= 0 ? fchmod(fd, x->mode & 07777) : chmod(full, x->mode & 07777)) != 0) {
+        restore_warn(x->path, "permissions");
+    }
+
+    struct timespec ts[2];
+    ts[0].tv_sec = x->atime;
+    ts[0].tv_nsec = x->atime_nsec;
+    ts[1].tv_sec = x->mtime;
+    ts[1].tv_nsec = x->mtime_nsec;
+    if ((fd >= 0 ? futimens(fd, ts) : utimensat(AT_FDCWD, full, ts, AT_SYMLINK_NOFOLLOW)) != 0) {
+        restore_warn(x->path, "timestamps");
+    }
+}
 
 static void report(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -2904,14 +3155,6 @@ static int clear_path(const char *path) {
     return unlink(path);
 }
 
-static void set_times(const char *path, int64_t mtime) {
-    struct timespec ts[2];
-    ts[0].tv_sec = mtime;
-    ts[0].tv_nsec = 0;
-    ts[1] = ts[0];
-    utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW);
-}
-
 static xentry_t *g_xentries;
 
 static int cmp_data_off(const void *a, const void *b) {
@@ -2947,16 +3190,30 @@ static int open_or_die(image_t *img, const char *path) {
 static int cmd_list(const char *image) {
     image_t img;
     if (open_or_die(&img, image) != 0) return 1;
+    // Remember each entry's path so hard links can name their target
+    const char **paths = calloc(img.h.node_count ? img.h.node_count : 1, sizeof(char*));
+    uint32_t *lens = calloc(img.h.node_count ? img.h.node_count : 1, sizeof(uint32_t));
+    if (!paths || !lens) {
+        fprintf(stderr, "\033[31mError: out of memory\033[0m\n");
+        return 1;
+    }
     size_t pos = 0;
+    uint32_t i = 0;
     meta_entry_t e;
     while (meta_next(&img, &pos, &e) == 1) {
+        paths[i] = e.path;
+        lens[i] = e.path_len;
         char ms[11];
         mode_string(e.mode, ms);
         printf("%s %8u %8u %12" PRIu64 "  %.*s", ms, e.uid, e.gid, e.size,
                e.path_len ? (int)e.path_len : 1, e.path_len ? e.path : ".");
         if (S_ISLNK(e.mode)) printf(" -> %.*s", (int)e.target_len, e.target);
+        if (e.link != NO_LINK) printf(" (hard link to %.*s)", (int)lens[e.link], paths[e.link]);
         printf("\n");
+        i++;
     }
+    free(paths);
+    free(lens);
     image_close(&img);
     return 0;
 }
@@ -3017,15 +3274,21 @@ static int cmd_extract(const char *image, const char *dest, int verbose) {
         x->uid = e.uid;
         x->gid = e.gid;
         x->mtime = e.mtime;
+        x->mtime_nsec = e.mtime_nsec;
+        x->atime = e.atime;
+        x->atime_nsec = e.atime_nsec;
+        x->xattr_count = e.xattr_count;
+        x->xattrs = e.xattrs;
         x->data_off = e.data_off;
         x->size = e.size;
         x->crc = e.crc;
         x->rdev = e.rdev;
+        x->link = e.link;
         if (!safe_rel_path(x->path)) {
             report("unsafe path skipped: %s", x->path);
             x->mode = 0;
-        } else if (S_ISREG(x->mode)) {
-            files[nfiles++] = n;
+        } else if (S_ISREG(x->mode) && x->link == NO_LINK) {
+            files[nfiles++] = n;    // hard links are made after their target exists
         }
         n++;
     }
@@ -3045,6 +3308,10 @@ static int cmd_extract(const char *image, const char *dest, int verbose) {
         dest = dest_abs;
         is_root = (geteuid() == 0);
         umask(0);
+        if (!is_root) {
+            fprintf(stderr, "\033[33mNote: not running as root - file owners, file capabilities and some attributes\n"
+                            "cannot be restored. Use sudo for an exact copy.\033[0m\n");
+        }
     }
 
     char full[MAX_PATH_LEN * 2];
@@ -3098,18 +3365,32 @@ static int cmd_extract(const char *image, const char *dest, int verbose) {
         total += done;
 
         if (fd >= 0) {
-            if (is_root && fchown(fd, x->uid, x->gid) != 0) { /* best effort */ }
-            fchmod(fd, x->mode & 07777);
-            struct timespec ts[2];
-            ts[0].tv_sec = x->mtime;
-            ts[0].tv_nsec = 0;
-            ts[1] = ts[0];
-            futimens(fd, ts);
+            restore_meta(x, full, fd, is_root);
             if (close(fd) != 0) report("%s: write failed: %s", x->path, strerror(errno));
         }
     }
 
-    // 3. Symlinks and special files
+    // 3. Hard links to the files written above
+    if (dest) {
+        char target_full[MAX_PATH_LEN * 2];
+        for (uint32_t i = 0; i < n; i++) {
+            xentry_t *x = &xs[i];
+            if (x->mode == 0 || !S_ISREG(x->mode) || x->link == NO_LINK) continue;
+            if (verbose) printf("%s\n", x->path);
+            const xentry_t *t = &xs[x->link];
+            if (t->mode == 0) {
+                report("%s: hard link target was skipped", x->path);
+                continue;
+            }
+            snprintf(full, sizeof(full), "%s/%s", dest, x->path);
+            snprintf(target_full, sizeof(target_full), "%s/%s", dest, t->path);
+            if (make_dirs(dest, x->path, 0) != 0 || clear_path(full) != 0 || link(target_full, full) != 0) {
+                report("%s: cannot create hard link to %s: %s", x->path, t->path, strerror(errno));
+            }
+        }
+    }
+
+    // 4. Symlinks and special files
     if (dest) {
         for (uint32_t i = 0; i < n; i++) {
             xentry_t *x = &xs[i];
@@ -3133,18 +3414,15 @@ static int cmd_extract(const char *image, const char *dest, int verbose) {
                 }
                 continue;
             }
-            if (is_root && lchown(full, x->uid, x->gid) != 0) { /* best effort */ }
-            set_times(full, x->mtime);
+            restore_meta(x, full, -1, is_root);
         }
 
-        // 4. Directory permissions and times last, deepest first
+        // 5. Directory owners, attributes, permissions and times last, deepest first
         for (uint32_t i = n; i-- > 0;) {
             xentry_t *x = &xs[i];
             if (!S_ISDIR(x->mode) || x->path[0] == '\0') continue;
             snprintf(full, sizeof(full), "%s/%s", dest, x->path);
-            if (is_root && lchown(full, x->uid, x->gid) != 0) { /* best effort */ }
-            chmod(full, x->mode & 07777);
-            set_times(full, x->mtime);
+            restore_meta(x, full, -1, is_root);
         }
     }
 
@@ -3165,6 +3443,11 @@ static int cmd_extract(const char *image, const char *dest, int verbose) {
         fprintf(stderr, "\033[31m%u error(s) in %u entries.\033[0m\n", error_count, n);
         return 1;
     }
+    if (restore_warnings > 0) {
+        printf("\033[33mExtracted %u entries (%s), but %u owner/permission/attribute/time setting(s) could not be\n"
+               "restored - see the warnings above.\033[0m\n", n, tot, restore_warnings);
+        return 2;
+    }
     printf("\033[32mOK: %u entries, %s of file data verified%s.\033[0m\n", n, tot, dest ? " and extracted" : "");
     return 0;
 }
@@ -3177,9 +3460,14 @@ typedef struct mnode {
     char *path;              // relative, "" for the root
     const char *name;        // last component (points into path)
     uint32_t mode, uid, gid;
-    int64_t mtime;
+    int64_t mtime, atime;
+    uint32_t mtime_nsec, atime_nsec;
     uint64_t size, data_off, rdev, ino;
     char *target;
+    uint32_t xattr_count;
+    const uint8_t *xattrs;   // points into the image's metadata
+    struct mnode *owner;     // hard links: the first name of the file (itself otherwise)
+    uint32_t links;          // on the owner: number of names for the file
     struct mnode **children;
     uint32_t nchildren, children_cap, nsubdirs;
 } mnode_t;
@@ -3233,11 +3521,15 @@ static int build_mount_index(void) {
     while (table_size < (uint64_t)g_img.h.node_count * 2) table_size *= 2;
     g_table = calloc(table_size, sizeof(mnode_t*));
     g_mask = table_size - 1;
-    if (!g_nodes || !g_table) return -1;
+    // metadata position -> node, to resolve hard links
+    mnode_t **by_meta = calloc(g_img.h.node_count ? g_img.h.node_count : 1, sizeof(mnode_t*));
+    if (!g_nodes || !g_table || !by_meta) return -1;
 
     size_t pos = 0;
+    uint32_t meta_pos = 0;
     meta_entry_t e;
     while (meta_next(&g_img, &pos, &e) == 1) {
+        uint32_t this_meta = meta_pos++;
         mnode_t *n = &g_nodes[g_node_count];
         n->path = strndup(e.path, e.path_len);
         if (!n->path) return -1;
@@ -3252,10 +3544,22 @@ static int build_mount_index(void) {
         n->uid = e.uid;
         n->gid = e.gid;
         n->mtime = e.mtime;
+        n->mtime_nsec = e.mtime_nsec;
+        n->atime = e.atime;
+        n->atime_nsec = e.atime_nsec;
+        n->xattr_count = e.xattr_count;
+        n->xattrs = e.xattrs;
         n->size = S_ISLNK(e.mode) ? e.target_len : e.size;
         n->data_off = e.data_off;
         n->rdev = e.rdev;
         n->ino = g_node_count + 1;
+        n->owner = n;
+        n->links = 1;
+        if (e.link != NO_LINK && by_meta[e.link]) {
+            // Another name for an earlier file: same inode, one more link
+            n->owner = by_meta[e.link];
+            n->owner->links++;
+        }
         if (S_ISLNK(e.mode)) {
             n->target = strndup(e.target, e.target_len);
             if (!n->target) return -1;
@@ -3266,6 +3570,7 @@ static int build_mount_index(void) {
             mnode_t *parent = mlookup_n(n->path, slash ? (size_t)(slash - n->path) : 0);
             if (!parent || !S_ISDIR(parent->mode)) {
                 fprintf(stderr, "claudex: '%s' has no parent directory, skipped\n", n->path);
+                if (n->owner != n) n->owner->links--;
                 free(n->path);
                 free(n->target);
                 continue;
@@ -3287,8 +3592,10 @@ static int build_mount_index(void) {
                 break;
             }
         }
+        by_meta[this_meta] = n;
         g_node_count++;
     }
+    free(by_meta);
 
     mnode_t *root = mlookup("");
     if (!root || !S_ISDIR(root->mode)) {
@@ -3320,22 +3627,29 @@ static block_cache_t* thread_cache(void) {
 
 static void fill_stat(const mnode_t *n, struct stat *st) {
     memset(st, 0, sizeof(*st));
-    st->st_ino = n->ino;
+    st->st_ino = n->owner->ino;
     st->st_mode = n->mode;
     st->st_uid = n->uid;
     st->st_gid = n->gid;
     st->st_size = (off_t)n->size;
     st->st_rdev = (dev_t)n->rdev;
-    st->st_nlink = S_ISDIR(n->mode) ? 2 + n->nsubdirs : 1;
+    st->st_nlink = S_ISDIR(n->mode) ? 2 + n->nsubdirs : n->owner->links;
     st->st_blksize = 4096;
     st->st_blocks = (blkcnt_t)((n->size + 511) / 512);
     st->st_mtim.tv_sec = n->mtime;
-    st->st_atim.tv_sec = n->mtime;
-    st->st_ctim.tv_sec = n->mtime;
+    st->st_mtim.tv_nsec = n->mtime_nsec;
+    st->st_atim.tv_sec = n->atime;
+    st->st_atim.tv_nsec = n->atime_nsec;
+    st->st_ctim = st->st_mtim;
 }
 
 static void* fs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+#ifdef FUSE_CAP_POSIX_ACL
+    // Let the kernel enforce stored ACLs (system.posix_acl_* attributes)
+    if (conn->capable & FUSE_CAP_POSIX_ACL) conn->want |= FUSE_CAP_POSIX_ACL;
+#else
     (void)conn;
+#endif
     cfg->use_ino = 1;
     cfg->kernel_cache = 1;          // the image never changes while mounted
     cfg->entry_timeout = 3600;
@@ -3452,6 +3766,46 @@ static int fs_read(const char *path, char *buf, size_t size, off_t offset, struc
     return (int)size;
 }
 
+static int fs_getxattr(const char *path, const char *name, char *value, size_t size) {
+    mnode_t *n = mlookup(path);
+    if (!n) return -ENOENT;
+    n = n->owner;   // hard links share one set of attributes
+    const uint8_t *rec = n->xattrs;
+    char rname[XATTR_NAME_MAX_LEN + 1];
+    for (uint32_t i = 0; i < n->xattr_count; i++) {
+        const uint8_t *v;
+        uint32_t vlen;
+        rec = xattr_next(rec, rname, &v, &vlen);
+        if (strcmp(rname, name) != 0) continue;
+        if (size == 0) return (int)vlen;
+        if (size < vlen) return -ERANGE;
+        memcpy(value, v, vlen);
+        return (int)vlen;
+    }
+    return -ENODATA;
+}
+
+static int fs_listxattr(const char *path, char *list, size_t size) {
+    mnode_t *n = mlookup(path);
+    if (!n) return -ENOENT;
+    n = n->owner;
+    const uint8_t *rec = n->xattrs;
+    char rname[XATTR_NAME_MAX_LEN + 1];
+    size_t total = 0;
+    for (uint32_t i = 0; i < n->xattr_count; i++) {
+        const uint8_t *v;
+        uint32_t vlen;
+        rec = xattr_next(rec, rname, &v, &vlen);
+        size_t len = strlen(rname) + 1;
+        if (size > 0) {
+            if (total + len > size) return -ERANGE;
+            memcpy(list + total, rname, len);
+        }
+        total += len;
+    }
+    return (int)total;
+}
+
 static int fs_statfs(const char *path, struct statvfs *sv) {
     (void)path;
     memset(sv, 0, sizeof(*sv));
@@ -3472,6 +3826,8 @@ static const struct fuse_operations fs_ops = {
     .open     = fs_open,
     .read     = fs_read,
     .statfs   = fs_statfs,
+    .getxattr = fs_getxattr,
+    .listxattr = fs_listxattr,
 };
 
 static int cmd_mount(int argc, char **argv, char *prog) {
