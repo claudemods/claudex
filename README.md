@@ -1,18 +1,230 @@
 # claudex
-This is mkfs.claudex - a filesystem compression tool that creates .claudex archive images from directory structures
 
+![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 
-claudex uses lzma compression algorithm with custom multi-threading and random access 
+A compressed, mountable, bootable filesystem image format for Linux, with its own compression engine.
 
-with that i have found a very good ratio thats fast and compressed to my needs it also reads using fuse3 when mounted
+`claudex` packs a whole directory tree, or a whole Arch Linux system, into a single `.claudex` image file. You can then:
 
-(more tests going on this is just a template ui will change)
+- **mount** it read-only through FUSE and browse it like a normal folder
+- **boot** it as a live root filesystem from an ISO or USB stick, using the included mkinitcpio hook
+- **extract** or **verify** it at any time
 
+Everything, including the compressor, is in one C file. No zlib, zstd or xz is used.
 
-<img width="1280" height="800" alt="yes" src="https://github.com/user-attachments/assets/fd140765-6abd-4e50-b0d7-e0645c77b6d8" />
+---
 
-<img width="1280" height="800" alt="testing" src="https://github.com/user-attachments/assets/adc5c6c0-8d63-435b-aca9-7e3a11a5f07e" />
+## Features
 
+- **Custom compressor (CX).** LZ77 matching with an adaptive range coder. Literals, lengths and distances are each predicted from context.
+- **Optimal parsing** at levels 8–9. The compressor picks the cheapest combination of matches over the next few thousand bytes instead of always taking the longest one.
+- **x86 filter.** In blocks of program and library code, call addresses are made absolute so repeated calls compress better.
+- **Solid packing.** All file data is concatenated into one stream, so small files compress together instead of one by one.
+- **Similar files grouped.** Files are ordered by extension so related content sits next to each other.
+- **Deduplication.** Identical files are stored once. Matches are confirmed byte by byte, never by hash alone.
+- **Multithreaded.** Every block is compressed in parallel, including blocks of a single huge file.
+- **Random access.** Data is split into independent blocks, so reading one file only decompresses the blocks it covers.
+- **Integrity checks.** CRC-32 covers every file, the block table and the metadata. Every compressed block is decompressed and compared with the original before it is written.
+- **Bootable.** The `--rootfs` mount mode plus a mkinitcpio hook let a `.claudex` image act as the root filesystem of a live system.
+- **Sensible default excludes** for system images: `/proc`, `/sys`, caches, logs, the pacman package cache, and so on.
+- **Progress bar on a single line,** with a spinner, that adapts to the terminal width.
 
+---
 
+## Requirements
 
+- Linux
+- `gcc`, `make`, `pkg-config`
+- `fuse3`, used for mounting and booting
+
+On Arch Linux:
+
+```bash
+sudo pacman -S --needed base-devel fuse3
+```
+
+---
+
+## Building
+
+```bash
+make
+sudo make install      # installs to /usr/local/bin/claudex
+```
+
+---
+
+## Usage
+
+### Create an image
+
+```bash
+claudex create [options] <source-dir> <image>
+```
+
+| Option | Description |
+|---|---|
+| `-l <0-9>` | Compression level. Default `9` (maximum, optimal parsing); `0` = store only. Levels 1–7 are faster. |
+| `-b <size>` | Block size, e.g. `256K`, `1M`, `4M`, `16M`. Default `1M`. Bigger means a smaller image but slower random reads when mounted. |
+| `-T <n>` | Number of threads. Default: all CPUs. |
+| `--exclude=<path>` | Skip a path or pattern (`*`, `?`, `[...]`), in addition to the defaults. Can be repeated. |
+| `--no-default-excludes` | Don't apply the default excludes listed below. |
+| `--no-dedup` | Don't look for identical files. |
+| `-q` | No progress bar. |
+
+If `<image>` is an existing folder, the image is written inside it as `backup.claudex`. Otherwise `.claudex` is added to the name if it's missing. Any missing parent folders are created.
+
+Examples:
+
+```bash
+# Back up a home folder
+claudex create /home/test /home/test/pictures/backup
+
+# Whole system, maximum compression, 4 MiB blocks
+sudo claudex create -b 4M / /mnt/storage/root.claudex
+
+# Faster, with extra excludes
+claudex create -l 6 --exclude=/home/test/Downloads --exclude='/home/*/Videos' /home home.claudex
+```
+
+### Mount an image
+
+```bash
+claudex mount <image> <mountpoint> [-f] [-o options]
+fusermount3 -u <mountpoint>        # unmount
+```
+
+The mount is read-only. File owners and permissions are enforced as stored. `-f` keeps it in the foreground.
+
+### Extract, verify, list, inspect
+
+```bash
+claudex extract <image> [destination] [-v]   # default destination: current folder
+claudex test <image>                         # verify every file's checksum
+claudex list <image>                         # ls -l style listing
+claudex info <image>                         # sizes, ratio, block statistics
+```
+
+---
+
+## Default excludes
+
+These are skipped unless you pass `--no-default-excludes`. Each path is only excluded when it lies *inside* the folder you're packing, so packing `/tmp/project` itself still works.
+
+| Path | Why |
+|---|---|
+| `/proc` `/sys` `/dev` `/run` | Virtual filesystems |
+| `/tmp` `/var/tmp` | Temporary files |
+| `/mnt` `/media` | Other mounted drives |
+| `/lost+found` `/swapfile` `/swap.img` | Not system data |
+| `/var/cache/pacman/pkg` | Downloaded packages (already compressed, often several GB) |
+| `/home/*/.cache` `/root/.cache` | Application caches |
+| `/var/log/journal` `/var/lib/systemd/coredump` | Logs and crash dumps |
+| any file named `backup.claudex` | Older images |
+
+The image being written is never packed into itself.
+
+---
+
+## Booting a live system from an image
+
+`claudex` can serve an image as the root filesystem of a live system. A writable RAM layer (overlayfs) goes on top, the same idea as the official Arch ISO's `airootfs`.
+
+**1. Create the image of your system**
+
+```bash
+sudo claudex create / /path/to/root.claudex
+```
+
+Recreate the image after kernel updates. The live system loads kernel modules from the image, so they must match the kernel on the ISO.
+
+**2. Install the mkinitcpio hook**
+
+```bash
+sudo claudex initcpio                         # writes /etc/initcpio/{install,hooks}/claudex
+# or into your ISO profile:
+claudex initcpio myprofile/airootfs/etc/initcpio
+```
+
+**3. Build the ISO's initramfs with the hook**
+
+```
+HOOKS=(base udev modconf block filesystems keyboard claudex)
+```
+
+Don't use `autodetect`. It would limit the initramfs to the build machine's hardware. The `claudex` binary must be in `PATH` when mkinitcpio runs.
+
+**4. Kernel parameters**
+
+| Parameter | Description |
+|---|---|
+| `claudex=<path>` | Path of the image on the boot media, e.g. `claudex=/arch/root.claudex` (required) |
+| `claudex_dev=<device>` | Device holding the image. Default: search every disk and optical drive. |
+| `claudex_copytoram=y` | Copy the image into RAM before mounting (needs more RAM than the image size) |
+| `cow_spacesize=<size>` | Size of the writable RAM layer, default `75%` |
+
+At boot the hook:
+
+1. finds the boot media
+2. mounts the image with `claudex mount --rootfs`
+3. layers a tmpfs on top with overlayfs
+4. replaces `/etc/fstab` with an empty one, since the original disks won't be there (the original is kept as `/etc/fstab.claudex`)
+
+The FUSE process names itself with a leading `@`, so systemd leaves it running until the very end of shutdown.
+
+---
+
+## How the compression works
+
+1. **Scan.** The source tree is walked and excludes are applied.
+2. **Order.** Regular files are sorted by extension, then name, so similar data ends up next to each other.
+3. **Deduplicate.** Files that share a size are checksummed in parallel, and checksum matches are confirmed byte by byte. Duplicates point at the first copy.
+4. **Stream.** File contents are concatenated into one data stream and cut into fixed-size blocks.
+5. **Compress.** Worker threads compress the blocks in parallel:
+   - Blocks that look like x86 code first go through the call-address filter.
+   - The CX encoder (LZ77 plus range coder) compresses the block. At levels 8–9 it uses optimal parsing.
+   - Every block is decompressed and compared with the original. If a block doesn't shrink, or the check fails, it is stored raw.
+6. **Write.** Blocks are written strictly in order, followed by the block table, the compressed metadata (paths, modes, owners, times, symlink targets) and a footer.
+
+---
+
+## Image format (version 4)
+
+All integers are little-endian.
+
+```
+header       96 bytes   magic "CLDX", version, level, block size, counts,
+                        offsets, sizes, CRC-32 of the header
+data blocks             compressed (CX / CX+x86) or stored blocks of the data stream
+block table             per block: offset (u64), stored length (u32), type (u8), padding
+metadata                chunks {raw_len u32, stored_len u32, type u8, data}
+footer       8 bytes    "CLDE" + entry count
+```
+
+Each metadata entry holds a path, mode, uid, gid and mtime. Regular files add data offset, size and CRC-32. Symlinks add a target. Device nodes add rdev. Parent directories always come before their contents.
+
+---
+
+## Limitations
+
+- Extended attributes, ACLs and file capabilities are not stored.
+- Hard links are restored as separate files. Their data is still stored only once.
+- Images are read-only. Rebuild to change contents.
+- x86 filtering only targets x86/x86-64 code. Other architectures still compress, just without the filter.
+- Maximum block size is 64 MiB. Maximum path length is 8191 bytes.
+
+---
+
+## Project layout
+
+```
+claudex.c    the whole program: compressor, image writer/reader, FUSE driver, boot hook
+Makefile     build / install
+LICENSE      MIT license
+```
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
