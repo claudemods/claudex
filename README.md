@@ -4,7 +4,7 @@
 
 A compressed, mountable, bootable filesystem image format for Linux, with its own compression engine.
 
-`claudex` packs a whole directory tree, or a whole Arch Linux system, into a single `.claudex` image file. You can then:
+`mkfs.claudex` packs a whole directory tree, or a whole Arch Linux system, into a single `.claudex` image file. You can then:
 
 - **mount** it read-only through FUSE and browse it like a normal folder
 - **boot** it as a live root filesystem from an ISO or USB stick, using the included mkinitcpio hook
@@ -22,6 +22,14 @@ Everything, including the compressor, is in one C file. No zlib, zstd or xz is u
 - **Solid packing.** All file data is concatenated into one stream, so small files compress together instead of one by one.
 - **Similar files grouped.** Files are ordered by extension so related content sits next to each other.
 - **Deduplication.** Identical files are stored once. Matches are confirmed byte by byte, never by hash alone.
+- **Hard links preserved.** Hard-linked names are stored once and restored as real hard links. When mounted they share one inode and the correct link count.
+- **Exact permissions and metadata.** The image keeps:
+  - owner, group and mode, including setuid, setgid and sticky bits
+  - every extended attribute: ACLs, file capabilities and security labels
+  - modification and access times to the nanosecond
+
+  These are restored on extract and reported when mounted or booted, with ACLs enforced.
+- **Read-only on your system.** Source files are only ever read, and are opened with `O_NOATIME` so even their access times stay unchanged.
 - **Multithreaded.** Every block is compressed in parallel, including blocks of a single huge file.
 - **Random access.** Data is split into independent blocks, so reading one file only decompresses the blocks it covers.
 - **Integrity checks.** CRC-32 covers every file, the block table and the metadata. Every compressed block is decompressed and compared with the original before it is written.
@@ -49,7 +57,7 @@ sudo pacman -S --needed base-devel fuse3
 
 ```bash
 make
-sudo make install      # installs to /usr/local/bin/claudex
+sudo make install      # installs to /usr/local/bin/mkfs.claudex
 ```
 
 ---
@@ -59,7 +67,7 @@ sudo make install      # installs to /usr/local/bin/claudex
 ### Create an image
 
 ```bash
-claudex create [options] <source-dir> <image>
+mkfs.claudex create [options] <source-dir> <image>
 ```
 
 | Option | Description |
@@ -78,19 +86,19 @@ Examples:
 
 ```bash
 # Back up a home folder
-claudex create /home/test /home/test/pictures/backup
+mkfs.claudex create /home/test /home/test/pictures/backup
 
 # Whole system, maximum compression, 4 MiB blocks
-sudo claudex create -b 4M / /mnt/storage/root.claudex
+sudo mkfs.claudex create -b 4M / /mnt/storage/root.claudex
 
 # Faster, with extra excludes
-claudex create -l 6 --exclude=/home/test/Downloads --exclude='/home/*/Videos' /home home.claudex
+mkfs.claudex create -l 6 --exclude=/home/test/Downloads --exclude='/home/*/Videos' /home home.claudex
 ```
 
 ### Mount an image
 
 ```bash
-claudex mount <image> <mountpoint> [-f] [-o options]
+mkfs.claudex mount <image> <mountpoint> [-f] [-o options]
 fusermount3 -u <mountpoint>        # unmount
 ```
 
@@ -99,10 +107,10 @@ The mount is read-only. File owners and permissions are enforced as stored. `-f`
 ### Extract, verify, list, inspect
 
 ```bash
-claudex extract <image> [destination] [-v]   # default destination: current folder
-claudex test <image>                         # verify every file's checksum
-claudex list <image>                         # ls -l style listing
-claudex info <image>                         # sizes, ratio, block statistics
+sudo mkfs.claudex extract <image> [destination] [-v]   # default destination: current folder; sudo restores owners/capabilities
+mkfs.claudex test <image>                         # verify every file's checksum
+mkfs.claudex list <image>                         # ls -l style listing
+mkfs.claudex info <image>                         # sizes, ratio, block statistics
 ```
 
 ---
@@ -120,6 +128,7 @@ These are skipped unless you pass `--no-default-excludes`. Each path is only exc
 | `/var/cache/pacman/pkg` | Downloaded packages (already compressed, often several GB) |
 | `/home/*/.cache` `/root/.cache` | Application caches |
 | `/var/log/journal` `/var/lib/systemd/coredump` | Logs and crash dumps |
+| `/etc/fstab` | Lists the original machine's disks, which won't exist when the image is booted elsewhere |
 | any file named `backup.claudex` | Older images |
 
 The image being written is never packed into itself.
@@ -128,12 +137,12 @@ The image being written is never packed into itself.
 
 ## Booting a live system from an image
 
-`claudex` can serve an image as the root filesystem of a live system. A writable RAM layer (overlayfs) goes on top, the same idea as the official Arch ISO's `airootfs`.
+`mkfs.claudex` can serve an image as the root filesystem of a live system. A writable RAM layer (overlayfs) goes on top, the same idea as the official Arch ISO's `airootfs`.
 
 **1. Create the image of your system**
 
 ```bash
-sudo claudex create / /path/to/root.claudex
+sudo mkfs.claudex create / /path/to/root.claudex
 ```
 
 Recreate the image after kernel updates. The live system loads kernel modules from the image, so they must match the kernel on the ISO.
@@ -141,9 +150,9 @@ Recreate the image after kernel updates. The live system loads kernel modules fr
 **2. Install the mkinitcpio hook**
 
 ```bash
-sudo claudex initcpio                         # writes /etc/initcpio/{install,hooks}/claudex
+sudo mkfs.claudex initcpio                         # writes /etc/initcpio/{install,hooks}/claudex
 # or into your ISO profile:
-claudex initcpio myprofile/airootfs/etc/initcpio
+mkfs.claudex initcpio myprofile/airootfs/etc/initcpio
 ```
 
 **3. Build the ISO's initramfs with the hook**
@@ -152,7 +161,7 @@ claudex initcpio myprofile/airootfs/etc/initcpio
 HOOKS=(base udev modconf block filesystems keyboard claudex)
 ```
 
-Don't use `autodetect`. It would limit the initramfs to the build machine's hardware. The `claudex` binary must be in `PATH` when mkinitcpio runs.
+Don't use `autodetect`. It would limit the initramfs to the build machine's hardware. `mkfs.claudex` must be in `PATH` when mkinitcpio runs.
 
 **4. Kernel parameters**
 
@@ -166,9 +175,10 @@ Don't use `autodetect`. It would limit the initramfs to the build machine's hard
 At boot the hook:
 
 1. finds the boot media
-2. mounts the image with `claudex mount --rootfs`
+2. mounts the image with `mkfs.claudex mount --rootfs`
 3. layers a tmpfs on top with overlayfs
-4. replaces `/etc/fstab` with an empty one, since the original disks won't be there (the original is kept as `/etc/fstab.claudex`)
+
+The image is used exactly as packed. `/etc/fstab` is left out by the default excludes.
 
 The FUSE process names itself with a leading `@`, so systemd leaves it running until the very end of shutdown.
 
@@ -188,7 +198,7 @@ The FUSE process names itself with a leading `@`, so systemd leaves it running u
 
 ---
 
-## Image format (version 4)
+## Image format (version 6)
 
 All integers are little-endian.
 
@@ -201,13 +211,15 @@ metadata                chunks {raw_len u32, stored_len u32, type u8, data}
 footer       8 bytes    "CLDE" + entry count
 ```
 
-Each metadata entry holds a path, mode, uid, gid and mtime. Regular files add data offset, size and CRC-32. Symlinks add a target. Device nodes add rdev. Parent directories always come before their contents.
+Each metadata entry holds a path, mode, uid, gid, mtime and atime (each with nanoseconds), and its extended attributes. Regular files add data offset, size, CRC-32, and a hard-link reference to an earlier entry (if any). Symlinks add a target. Device nodes add rdev. Parent directories always come before their contents.
 
 ---
 
 ## Limitations
 
-- Extended attributes, ACLs and file capabilities are not stored.
+- Restoring owners, file capabilities and `trusted.*` attributes needs root. Run `sudo mkfs.claudex extract` for an exact copy. Without root, extract warns about anything it couldn't restore and exits with code 2.
+- The kernel always sets a file's change time (ctime) and inode number itself, so those can't be restored.
+- Inode flags set with `chattr` (immutable, append-only, no-COW) are not stored.
 - Images are read-only. Rebuild to change contents.
 - x86 filtering only targets x86/x86-64 code. Other architectures still compress, just without the filter.
 - Maximum block size is 64 MiB. Maximum path length is 8191 bytes.

@@ -4,13 +4,13 @@
  * Build:   make            (Arch: sudo pacman -S --needed base-devel fuse3)
  *
  * Usage:
- *   claudex create [options] <source-dir> <image>
- *   claudex mount   <image> <mountpoint> [-f] [-o options]
- *   claudex extract <image> [destination] [-v]
- *   claudex test    <image>
- *   claudex list    <image>
- *   claudex info    <image>
- *   claudex initcpio [dir]     install the mkinitcpio boot hook
+ *   mkfs.claudex create [options] <source-dir> <image>
+ *   mkfs.claudex mount   <image> <mountpoint> [-f] [-o options]
+ *   mkfs.claudex extract <image> [destination] [-v]
+ *   mkfs.claudex test    <image>
+ *   mkfs.claudex list    <image>
+ *   mkfs.claudex info    <image>
+ *   mkfs.claudex initcpio [dir]     install the mkinitcpio boot hook
  *
  * Codec ("CX"): LZ77 with a hash-chain match finder and repeat-distance
  * matches, entropy coded with an adaptive binary range coder (context-
@@ -2920,7 +2920,7 @@ static int cmd_create(int argc, char **argv) {
     if (p->threads > MAX_THREADS) p->threads = MAX_THREADS;
 
     if (!source || !output) {
-        fprintf(stderr, "\033[31mError: usage: claudex create [options] <source-dir> <image>\033[0m\n");
+        fprintf(stderr, "\033[31mError: usage: mkfs.claudex create [options] <source-dir> <image>\033[0m\n");
         return 1;
     }
 
@@ -3833,7 +3833,7 @@ static const struct fuse_operations fs_ops = {
 static int cmd_mount(int argc, char **argv, char *prog) {
     // argv: "mount" <image> <mountpoint> [--rootfs] [fuse options...]
     if (argc < 3) {
-        fprintf(stderr, "usage: claudex mount <image> <mountpoint> [--rootfs] [-f] [-o options]\n");
+        fprintf(stderr, "usage: mkfs.claudex mount <image> <mountpoint> [--rootfs] [-f] [-o options]\n");
         return 1;
     }
     int rootfs = 0;
@@ -3897,14 +3897,14 @@ static int cmd_mount(int argc, char **argv, char *prog) {
 // Copied into the initramfs build: what to include
 static const char initcpio_install[] =
     "#!/bin/bash\n"
-    "# claudex: boot from a .claudex image (installed by 'claudex initcpio')\n"
+    "# claudex: boot from a .claudex image (installed by 'mkfs.claudex initcpio')\n"
     "\n"
     "build() {\n"
     "    add_module fuse\n"
     "    add_module overlay\n"
     "    add_module isofs\n"
     "    add_module loop\n"
-    "    add_binary claudex /usr/bin/claudex\n"
+    "    add_binary mkfs.claudex /usr/bin/mkfs.claudex\n"
     "    add_runscript\n"
     "}\n"
     "\n"
@@ -3924,7 +3924,7 @@ static const char initcpio_install[] =
 // Runs inside the initramfs at boot
 static const char initcpio_hook[] =
     "#!/usr/bin/ash\n"
-    "# claudex: boot from a .claudex image (installed by 'claudex initcpio')\n"
+    "# claudex: boot from a .claudex image (installed by 'mkfs.claudex initcpio')\n"
     "\n"
     "run_hook() {\n"
     "    if [ -n \"${claudex}\" ]; then\n"
@@ -3983,7 +3983,7 @@ static const char initcpio_hook[] =
     "    fi\n"
     "\n"
     "    msg \":: Mounting ${claudex}...\"\n"
-    "    if ! claudex mount \"$img\" /run/claudex/lower --rootfs; then\n"
+    "    if ! mkfs.claudex mount \"$img\" /run/claudex/lower --rootfs; then\n"
     "        err \"claudex: cannot mount $img\"\n"
     "        launch_interactive_shell\n"
     "    fi\n"
@@ -4017,7 +4017,7 @@ static int cmd_initcpio(const char *dir) {
     }
     printf("\033[32mAdd 'claudex' to HOOKS (after 'filesystems') in the mkinitcpio config for your ISO's initramfs,\n"
            "and boot with the kernel parameter claudex=/path/to/image.claudex (path on the boot media).\n"
-           "The claudex binary must be in PATH when mkinitcpio runs (sudo make install).\033[0m\n");
+           "mkfs.claudex must be in PATH when mkinitcpio runs (sudo make install).\033[0m\n");
     return 0;
 
 fail:
@@ -4031,8 +4031,8 @@ fail:
 
 static void usage(void) {
     printf(
-        "claudex - compressed, mountable filesystem images\n\n"
-        "  claudex create [options] <source-dir> <image>\n"
+        "mkfs.claudex - compressed, mountable filesystem images\n\n"
+        "  mkfs.claudex create [options] <source-dir> <image>\n"
         "      -l <0-9>               compression level (default 9 = maximum; 0 = store only)\n"
         "      -b <size>              block size, e.g. 256K, 1M, 4M, 16M (default 1M; bigger = smaller\n"
         "                             image, slower random reads when mounted)\n"
@@ -4042,14 +4042,14 @@ static void usage(void) {
         "                             the pacman package cache, /etc/fstab or backup.claudex\n"
         "      --no-dedup             don't look for identical files\n"
         "      -q                     no progress bar\n"
-        "  claudex mount <image> <dir> [-f] [-o opts]   mount read-only (unmount: fusermount3 -u <dir>)\n"
+        "  mkfs.claudex mount <image> <dir> [-f] [-o opts]   mount read-only (unmount: fusermount3 -u <dir>)\n"
         "      --rootfs               serve as the root filesystem at boot (used by the initcpio hook)\n"
-        "  claudex extract <image> [dest] [-v]          extract (default: current directory)\n"
-        "  claudex test <image>                         verify every file\n"
-        "  claudex list <image>                         list contents\n"
-        "  claudex info <image>                         image statistics\n"
-        "  claudex initcpio [dir]                       install the boot hook for mkinitcpio\n"
-        "                                               (default dir: /etc/initcpio)\n");
+        "  mkfs.claudex extract <image> [dest] [-v]          extract (default: current directory)\n"
+        "  mkfs.claudex test <image>                         verify every file\n"
+        "  mkfs.claudex list <image>                         list contents\n"
+        "  mkfs.claudex info <image>                         image statistics\n"
+        "  mkfs.claudex initcpio [dir]                       install the boot hook for mkinitcpio\n"
+        "                                                    (default dir: /etc/initcpio)\n");
 }
 
 int main(int argc, char **argv) {
